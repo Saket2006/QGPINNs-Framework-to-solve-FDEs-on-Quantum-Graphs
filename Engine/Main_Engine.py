@@ -158,7 +158,7 @@ class GraphPINNSolver:
             optimizer.zero_grad()
             lp, ln = self.compute_losses()
 
-            # Update weights based on strategy
+
             if self.strategy == "gradient_ratio" and epoch % adaptive_every == 0:
                 g_p = torch.autograd.grad(lp, params, retain_graph=True, allow_unused=True)
                 g_n = torch.autograd.grad(ln, params, retain_graph=True, allow_unused=True)
@@ -169,7 +169,7 @@ class GraphPINNSolver:
             current_weight = self.mu if self.strategy == "bdmm" else self.lambda_node
             loss = lp + current_weight * ln
 
-            # Track the best performing weights
+
             if loss.item() < best_loss:
                 best_loss = loss.item()
                 best_models_state = {i: copy.deepcopy(m['net'].state_dict()) for i, m in self.models.items()}
@@ -183,12 +183,12 @@ class GraphPINNSolver:
             if epoch % 500 == 0:
                 print(f"Epoch {epoch:5d} | Loss: {loss.item():.2e} | PDE: {lp.item():.2e} | Node: {ln.item():.2e}")
 
-        # Load best state from the discovery phase
+
         if best_models_state:
             for i, m in self.models.items():
                 m['net'].load_state_dict(best_models_state[i])
 
-        # --- Stage 2: Settling Phase ---
+
         fixed_weight = self.mu if self.strategy == "bdmm" else self.lambda_node
         print(f"\n--- Stage 2: Settling (Adam with Fixed Weight: {fixed_weight:.2f}) ---")
 
@@ -199,7 +199,7 @@ class GraphPINNSolver:
             loss.backward()
             optimizer.step()
 
-        # --- Stage 3: L-BFGS Refinement ---
+
         if use_lbfgs:
             print("--- Stage 3: L-BFGS Refining ---")
             lbfgs = optim.LBFGS(params, max_iter=1000,

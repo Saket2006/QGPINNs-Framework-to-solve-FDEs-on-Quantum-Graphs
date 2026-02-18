@@ -34,7 +34,8 @@ $$u(x,t) = e^x t^2$$
 | **Iterations** | 10,000 | **RAD Sampling** | Disabled |
 | **Architecture** | 60x4 | **L1 Points** | 0 |
 
-![Run 1 Result] <img width="1829" height="687" alt="Screenshot 2026-02-18 211017" src="https://github.com/user-attachments/assets/9e1ccc9d-30fa-4476-ae24-b85d828b48f1" />
+![Run 1 Result] <img width="1591" height="592" alt="image" src="https://github.com/user-attachments/assets/5b6f8a7d-f1bf-4525-ab95-9846e021dd65" />
+
 
 
 #### Run 2: Hard Constraints

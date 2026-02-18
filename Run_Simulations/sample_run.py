@@ -57,7 +57,7 @@ if __name__ == "__main__":
         use_fourier=True,
         fourier_dim=64,
         fourier_sigma=1.0,
-        fourier_sampling="sobol"
+        #fourier_sampling="sobol"
     ).set_mesh(
         mesh_type="power_law",
         pinn_pts=100,

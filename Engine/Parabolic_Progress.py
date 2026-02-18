@@ -53,7 +53,7 @@ class PINN_Net(nn.Module):
 
         for m in self.net:
             if isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight)
+                nn.init.xavier_uniform_(m.weight, gain=nn.init.calculate_gain('tanh'))
                 nn.init.zeros_(m.bias)
 
     def forward(self, x):
@@ -197,64 +197,16 @@ class ParabolicPINNSolver:
         for row in range(1, n):
             t_nsig = (1.0 - sigma) * grid_np[row - 1] + sigma * grid_np[row]
 
-            A = np.zeros(row)
-            A[0] = ((1.0 - sigma) ** (1 - alpha)) * (tau[row - 1] ** (-alpha)) / g2a
-            for k in range(1, row):
-                tau_k = tau[k - 1]
-                left  = t_nsig - grid_np[k - 1]
-                right = t_nsig - grid_np[k]
+            for k in range(row):
+                tau_k = tau[k]
+                left  = t_nsig - grid_np[k]
+                right = t_nsig - grid_np[k + 1]
                 if left <= 0:
-                    A[k] = 0.0
-                else:
-                    A[k] = (left ** (1 - alpha) - max(right, 0.0) ** (1 - alpha)) \
-                           / (tau_k * g2a)
-
-            B = np.zeros(row)
-            for k in range(1, row):
-                if k >= len(tau):
                     continue
-                tau_k   = tau[k - 1]
-                tau_kp1 = tau[k] if k < len(tau) else tau[k - 1]
-                tau_km1 = tau[k - 2] if k >= 2 else tau[k - 1]
-                denom   = tau_k * (tau_kp1 + tau_km1) * g2a
-                if denom < 1e-30:
-                    continue
-
-                t_left    = t_nsig - grid_np[k - 1]
-                t_right   = t_nsig - grid_np[k]
-                if t_left <= 0:
-                    continue
-
-                t_right_c = max(t_right, 0.0)
-                piece1    = -(tau_k / 2.0) * (t_left ** (1 - alpha) + t_right_c ** (1 - alpha))
-                piece2    = (t_left ** (2 - alpha) - t_right_c ** (2 - alpha)) / (2.0 - alpha)
-                B[k]      = 2.0 * (piece1 + piece2) / denom
-
-            W[row, row]     += A[0]
-            W[row, row - 1] -= A[0]
-            for k in range(1, row):
-                W[row, k]     += A[k]
-                W[row, k - 1] -= A[k]
-
-            for k in range(1, row):
-                if k >= len(tau):
-                    continue
-                tau_k   = tau[k - 1]
-                tau_kp1 = tau[k] if k < len(tau) else tau[k - 1]
-                denom   = tau_kp1 + tau_k
-
-                if denom < 1e-30 or abs(B[k]) < 1e-30:
-                    continue
-
-                c_km1 =  tau_kp1 / (tau_k   * denom)
-                c_k   = -(tau_kp1 / (tau_k   * denom) + tau_k / (tau_kp1 * denom))
-                c_kp1 =  tau_k   / (tau_kp1  * denom)
-
-                if k - 1 >= 0:
-                    W[row, k - 1] -= B[k] * c_km1
-                W[row, k]         -= B[k] * c_k
-                if k + 1 < n:
-                    W[row, k + 1] -= B[k] * c_kp1
+                right_c = max(right, 0.0)
+                A_k = (left ** (1 - alpha) - right_c ** (1 - alpha)) / (tau_k * g2a)
+                W[row, k + 1] += A_k
+                W[row, k]     -= A_k
 
         return torch.tensor(W, dtype=torch.float64).to(device)
 
@@ -277,10 +229,15 @@ class ParabolicPINNSolver:
             if self.frac_scheme == "L21sigma":
                 if not hasattr(self, 'l21_sigma') or self.l21_sigma is None:
                     self.l21_sigma = 1.0 - alpha / 2.0
-                self.Dt_alpha = self._compute_l21sigma_matrix(alpha, t_np, self.l21_sigma)
+                self.Dt_alpha    = self._compute_l21sigma_matrix(alpha, t_np, self.l21_sigma)
+                t_nsig_np        = np.empty(self.n_t)
+                t_nsig_np[0]     = t_np[0]
+                t_nsig_np[1:]    = (1.0 - self.l21_sigma) * t_np[:-1] + self.l21_sigma * t_np[1:]
+                self.t_nsig_grid = torch.tensor(t_nsig_np).view(-1, 1).to(device)
                 print(f"[FracScheme] Using L2-1σ  (σ={self.l21_sigma:.4f}, α={alpha})")
             else:
-                self.Dt_alpha = self._compute_l1_matrix_vectorized(alpha, t_np)
+                self.Dt_alpha    = self._compute_l1_matrix_vectorized(alpha, t_np)
+                self.t_nsig_grid = None
                 print(f"[FracScheme] Using L1  (α={alpha})")
 
         for i, edge in enumerate(self.graph.edges):
@@ -299,19 +256,26 @@ class ParabolicPINNSolver:
                 fourier_sampling=self.fourier_sampling,
             ).to(device)
 
+            T_mesh = self.t_grid.repeat_interleave(n_x, dim=0)
+            if self.frac_scheme == "L21sigma":
+                T_mesh_nsig = self.t_nsig_grid.repeat_interleave(n_x, dim=0)
+            else:
+                T_mesh_nsig = T_mesh
+
             self.models[i] = {
-                'net': net,
-                'L': L,
-                'n_x': n_x,
-                'nodes': (u_node, v_node),
-                'x_grid': x_grid,
-                'X_mesh': x_grid.repeat(self.n_t, 1),
-                'T_mesh': self.t_grid.repeat_interleave(n_x, dim=0),
+                'net':         net,
+                'L':           L,
+                'n_x':         n_x,
+                'nodes':       (u_node, v_node),
+                'x_grid':      x_grid,
+                'X_mesh':      x_grid.repeat(self.n_t, 1),
+                'T_mesh':      T_mesh,
+                'T_mesh_nsig': T_mesh_nsig,
             }
 
             self.models[i]['f_target'] = self.physics.get_f_target(
                 self.models[i]['X_mesh'],
-                self.models[i]['T_mesh'],
+                self.models[i]['T_mesh_nsig'],
                 L
             ).view(-1, 1).to(device)
 
@@ -405,10 +369,11 @@ class ParabolicPINNSolver:
             new_X_rows = []
 
             for k in range(self.n_t):
-                t_k   = self.t_grid[k]
+                t_k    = self.t_grid[k]
+                t_k_ev = self.t_nsig_grid[k] if self.frac_scheme == "L21sigma" and self.t_nsig_grid is not None else t_k
                 n_cand = 10 * n_x
                 x_cand = torch.rand(n_cand, 1, dtype=torch.float64).to(device) * L
-                t_cand = t_k.expand(n_cand, 1)
+                t_cand = t_k_ev.expand(n_cand, 1)
 
                 with torch.no_grad():
                     dx   = L / (n_x * 10)
@@ -433,10 +398,10 @@ class ParabolicPINNSolver:
                 idx_sel = torch.multinomial(prob, n_x, replacement=True)
                 new_X_rows.append(x_cand[idx_sel])
 
-            new_X     = torch.cat(new_X_rows, dim=0).detach()
+            new_X       = torch.cat(new_X_rows, dim=0).detach()
             m['X_mesh'] = new_X
             m['f_target'] = self.physics.get_f_target(
-                m['X_mesh'], m['T_mesh'], L
+                m['X_mesh'], m['T_mesh_nsig'], L
             ).view(-1, 1).to(device)
 
     def compute_losses(self, epoch=0):
@@ -449,69 +414,58 @@ class ParabolicPINNSolver:
                     break
 
         for i, m in self.models.items():
-            X = m['X_mesh'].clone().detach().requires_grad_(True)
-            T = m['T_mesh'].clone().detach().requires_grad_(True)
+            X      = m['X_mesh'].clone().detach().requires_grad_(True)
+            T      = m['T_mesh'].clone().detach()
+            T_eval = m['T_mesh_nsig'].clone().detach().requires_grad_(True)
 
             if self.use_time_windowing:
-                mask = (T <= self.current_t_max).flatten()
+                mask   = (T <= self.current_t_max).flatten()
                 if mask.sum() == 0:
                     continue
-                X = X[mask].requires_grad_(True)
-                T = T[mask].requires_grad_(True)
+                X      = X[mask].requires_grad_(True)
+                T      = T[mask]
+                T_eval = T_eval[mask].requires_grad_(True)
 
-            u    = self.predict(i, X, T)
-            u_x  = torch.autograd.grad(u,   X, torch.ones_like(u),   create_graph=True)[0]
-            u_xx = torch.autograd.grad(u_x, X, torch.ones_like(u_x), create_graph=True)[0]
+            n_x_m = m['n_x']
+
+            if not self.use_time_windowing:
+                u_grid     = self.predict(i, m['X_mesh'], m['T_mesh'])
+                u_reshaped = u_grid.view(self.n_t, n_x_m)
+                dt_alpha_u = torch.mm(self.Dt_alpha, u_reshaped).view(-1, 1)
+            else:
+                X_full          = m['X_mesh'].clone()
+                T_full          = m['T_mesh'].clone()
+                u_full          = self.predict(i, X_full, T_full).view(self.n_t, n_x_m)
+                dt_alpha_u_full = torch.mm(self.Dt_alpha, u_full).view(-1, 1)
+                mask_full       = (T_full <= self.current_t_max).flatten()
+                dt_alpha_u      = dt_alpha_u_full[mask_full]
+
+            u_sp   = self.predict(i, X, T_eval)
+            u_x    = torch.autograd.grad(u_sp, X,   torch.ones_like(u_sp), create_graph=True)[0]
+            u_xx   = torch.autograd.grad(u_x,  X,   torch.ones_like(u_x),  create_graph=True)[0]
+
+            if self.use_time_windowing:
+                f_eval = self.physics.get_f_target(X, T_eval, m['L']).view(-1, 1)
+            else:
+                f_eval = m['f_target']
+
+            res = self.physics.F(X, T_eval, u_sp, u_x, u_xx, dt_alpha_u, f_eval)
 
             if self.use_causal and not self.use_time_windowing:
-                n_x_m = m['n_x']
-
-                if X.shape[0] == self.n_t * n_x_m:
-                    u_reshaped = u.view(self.n_t, n_x_m)
-                    dt_alpha_u = torch.mm(self.Dt_alpha, u_reshaped).view(-1, 1)
-                    res        = self.physics.F(X, T, u, u_x, u_xx, dt_alpha_u,
-                                               m['f_target'].view(-1, 1) if self.use_time_windowing else m['f_target'])
-                    res_t     = res.view(self.n_t, n_x_m)
-                    loss_t    = res_t.pow(2).mean(dim=1)
-                    cumsum    = torch.cumsum(loss_t, dim=0).roll(1)
-                    cumsum[0] = 0.0
-                    weights   = torch.exp(-self.causal_eps * cumsum).detach()
-                    lp       += (weights * loss_t).mean()
-                else:
-                    u_reshaped = u.view(self.n_t, n_x_m)
-                    dt_alpha_u = torch.mm(self.Dt_alpha, u_reshaped).view(-1, 1)
-                    res        = self.physics.F(X, T, u, u_x, u_xx, dt_alpha_u, m['f_target'])
-                    lp        += torch.mean(res ** 2)
+                res_t        = res.view(self.n_t, n_x_m)
+                loss_t       = res_t.pow(2).mean(dim=1)
+                loss_t       = loss_t[1:]
+                cumsum       = torch.cumsum(loss_t, dim=0).roll(1)
+                cumsum[0]    = 0.0
+                weights      = torch.exp(-self.causal_eps * cumsum).detach()
+                lp          += (weights * loss_t).mean()
+            elif not self.use_time_windowing:
+                res_t  = res.view(self.n_t, n_x_m)
+                lp    += torch.mean(res_t[1:] ** 2)
             else:
-                if X.shape[0] == self.n_t * m['n_x'] and not self.use_time_windowing:
-                    u_reshaped = u.view(self.n_t, m['n_x'])
-                    dt_alpha_u = torch.mm(self.Dt_alpha, u_reshaped).view(-1, 1)
-                else:
-                    if self.use_time_windowing:
-                        t_vals    = T.detach().cpu().numpy().flatten()
-                        t_grid_np = self.t_grid.cpu().numpy().flatten()
-
-                        active_t_levels = []
-                        for k in range(self.n_t):
-                            if np.any(np.abs(t_vals - t_grid_np[k]) < 1e-9):
-                                active_t_levels.append(k)
-
-                        X_full          = m['X_mesh'].clone().requires_grad_(True)
-                        T_full          = m['T_mesh'].clone().requires_grad_(True)
-                        u_full_flat     = self.predict(i, X_full, T_full)
-                        u_full          = u_full_flat.view(self.n_t, m['n_x'])
-                        dt_alpha_u_full = torch.mm(self.Dt_alpha, u_full).view(-1, 1)
-                        mask_full       = (T_full <= self.current_t_max).flatten()
-                        dt_alpha_u      = dt_alpha_u_full[mask_full]
-                        f_target_masked = self.physics.get_f_target(X, T, m['L']).view(-1, 1)
-                    else:
-                        u_reshaped      = u.view(self.n_t, m['n_x'])
-                        dt_alpha_u      = torch.mm(self.Dt_alpha, u_reshaped).view(-1, 1)
-                        f_target_masked = m['f_target']
-
-                res = self.physics.F(X, T, u, u_x, u_xx, dt_alpha_u,
-                                     f_target_masked if self.use_time_windowing else m['f_target'])
-                lp += torch.mean(res ** 2)
+                t0_mask = (T > 0).flatten()
+                if t0_mask.sum() > 0:
+                    lp += torch.mean(res[t0_mask] ** 2)
 
         for i, m in self.models.items():
             if self.constraint_mode == "soft":
@@ -562,6 +516,7 @@ class ParabolicPINNSolver:
     def update_weights_bdmm(self, ln):
         if ln.item() == 0: return
         self.lambda_bc += 0.5 * ln.item()
+        self.lambda_bc = min(self.lambda_bc, 1000.0)
 
     def update_weights_gradient_ratio(self, lp, ln, params):
         if ln.item() == 0: return
@@ -572,6 +527,7 @@ class ParabolicPINNSolver:
         if norm_ln > 1e-8:
             target = norm_lp / (norm_ln + 1e-8)
             self.lambda_bc = 0.9 * self.lambda_bc + 0.1 * target.item()
+            self.lambda_bc = float(np.clip(self.lambda_bc, 0.01, 1000.0))
 
     def update_weights_ntk(self, lp, ln, params):
         if ln.item() == 0:
@@ -585,6 +541,65 @@ class ParabolicPINNSolver:
         if norm_n > 1e-16:
             target = (norm_p / norm_n).sqrt().item()
             self.lambda_bc = 0.99 * self.lambda_bc + 0.01 * target
+            self.lambda_bc = float(np.clip(self.lambda_bc, 0.01, 1000.0))
+
+    def set_seed(self, seed):
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        return self
+
+    def train_multistart(self, epochs=3000, strategy="dual", use_lbfgs=True, n_starts=5, seed_base=0):
+        best_global_loss = float('inf')
+        best_global_weights = None
+
+        for s in range(n_starts):
+            seed = seed_base + s
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+
+            for m in self.models.values():
+                for layer in m['net'].net:
+                    if isinstance(layer, nn.Linear):
+                        nn.init.xavier_uniform_(layer.weight, gain=nn.init.calculate_gain('tanh'))
+                        nn.init.zeros_(layer.bias)
+
+            self.lambda_bc = 1.0
+            self.compiled = True
+
+            print(f"\n{'='*50}")
+            print(f"Multi-start {s+1}/{n_starts}  (seed={seed})")
+            print(f"{'='*50}")
+
+            self.train(epochs=epochs, strategy=strategy, use_lbfgs=False)
+
+            params = [p for m in self.models.values() for p in m['net'].parameters()]
+            lp, ln, _ = self.compute_losses(0)
+            candidate_loss = lp.item() + ln.item()
+
+            if candidate_loss < best_global_loss:
+                best_global_loss = candidate_loss
+                best_global_weights = [p.data.clone() for p in params]
+                print(f"  New best: {best_global_loss:.2e}")
+
+        params = [p for m in self.models.values() for p in m['net'].parameters()]
+        for p, best_p in zip(params, best_global_weights):
+            p.data.copy_(best_p)
+
+        if use_lbfgs:
+            print("\nFinal L-BFGS refinement on best multi-start solution...")
+            lbfgs = optim.LBFGS(params, max_iter=3000, line_search_fn="strong_wolfe")
+            epoch = epochs
+
+            def closure():
+                lbfgs.zero_grad()
+                lp_l, ln_l, _ = self.compute_losses(epoch)
+                loss_l = lp_l + self.lambda_bc * ln_l
+                loss_l.backward()
+                return loss_l
+
+            lbfgs.step(closure)
+
+        return self
 
     def train(self, epochs=3000, strategy="dual", use_lbfgs=True):
         self._planned_epochs = epochs
@@ -593,10 +608,8 @@ class ParabolicPINNSolver:
 
         params    = [p for m in self.models.values() for p in m['net'].parameters()]
         optimizer = optim.Adam(params, lr=self.lr)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5,
-            patience=self.scheduler_patience,
-            min_lr=self.scheduler_min_lr
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=epochs + 1, eta_min=self.scheduler_min_lr
         )
 
         best_loss    = float('inf')
@@ -664,8 +677,9 @@ class ParabolicPINNSolver:
                     best_weights = [p.data.clone() for p in params]
 
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
             optimizer.step()
-            scheduler.step(unweighted_loss if not use_validation else best_loss)
+            scheduler.step()
 
             if epoch % 500 == 0:
                 current_lr = optimizer.param_groups[0]['lr']
@@ -687,17 +701,41 @@ class ParabolicPINNSolver:
                 p.data.copy_(best_p)
 
         if use_lbfgs:
-            print("L-BFGS Refining...")
-            lbfgs = optim.LBFGS(params, max_iter=3000, line_search_fn="strong_wolfe")
+            if best_loss < 1e-3:
+                print(f"L-BFGS skipped (Adam loss {best_loss:.2e} already below 1e-3)")
+            else:
+                print("L-BFGS Refining...")
+                pre_lbfgs_weights = [p.data.clone() for p in params]
+                pre_lbfgs_loss    = best_loss
 
-            def closure():
-                lbfgs.zero_grad()
-                lp_l, ln_l, l_data_l = self.compute_losses(epoch)
-                loss_l = lp_l + self.lambda_bc * ln_l
-                loss_l.backward()
-                return loss_l
+                lbfgs = optim.LBFGS(
+                    params,
+                    max_iter=200,
+                    history_size=50,
+                    line_search_fn="strong_wolfe",
+                    tolerance_change=1e-12,
+                    tolerance_grad=1e-10,
+                )
 
-            lbfgs.step(closure)
+                def closure():
+                    lbfgs.zero_grad()
+                    lp_l, ln_l, l_data_l = self.compute_losses(epochs)
+                    loss_l = lp_l + self.lambda_bc * ln_l + l_data_l
+                    loss_l.backward()
+                    return loss_l
+
+                lbfgs.step(closure)
+
+                with torch.no_grad():
+                    lp_post, ln_post, _ = self.compute_losses(epochs)
+                    post_lbfgs_loss = lp_post.item() + ln_post.item()
+
+                if post_lbfgs_loss > pre_lbfgs_loss * 2.0:
+                    print(f"L-BFGS degraded ({pre_lbfgs_loss:.2e} -> {post_lbfgs_loss:.2e}), restoring Adam weights")
+                    for p, w in zip(params, pre_lbfgs_weights):
+                        p.data.copy_(w)
+                else:
+                    print(f"L-BFGS accepted ({pre_lbfgs_loss:.2e} -> {post_lbfgs_loss:.2e})")
 
     def report_l2(self, exact_func, eval_times=None):
         if eval_times is None:
@@ -864,56 +902,21 @@ class ParabolicPINNSolver:
         tau   = np.diff(t_np)
 
         def l21_diagonal_coeff(n):
-            return ((1.0 - sigma) ** (1 - alpha)) * (tau[n - 1] ** (-alpha)) / g2a
+            return (sigma ** (1 - alpha)) * (tau[n - 1] ** (-alpha)) / g2a
 
         def l21_history(n, u_all):
             t_nsig = (1.0 - sigma) * t_np[n - 1] + sigma * t_np[n]
             acc    = np.zeros(n_x)
 
-            for k in range(1, n):
-                tau_k = tau[k - 1]
-                left  = t_nsig - t_np[k - 1]
-                right = t_nsig - t_np[k]
+            for k in range(n - 1):
+                tau_k = tau[k]
+                left  = t_nsig - t_np[k]
+                right = t_nsig - t_np[k + 1]
                 if left <= 0:
                     continue
-                A_k = (left ** (1 - alpha) - max(right, 0.0) ** (1 - alpha)) / (tau_k * g2a)
-                acc += A_k * (u_all[k] - u_all[k - 1])
-
-            for k in range(1, n):
-                if k >= len(tau):
-                    continue
-                tau_k   = tau[k - 1]
-                tau_kp1 = tau[k] if k < len(tau) else tau[k - 1]
-                tau_km1 = tau[k - 2] if k >= 2 else tau[k - 1]
-                denom_B = tau_k * (tau_kp1 + tau_km1) * g2a
-                if denom_B < 1e-30:
-                    continue
-
-                t_left  = t_nsig - t_np[k - 1]
-                t_right = t_nsig - t_np[k]
-                if t_left <= 0:
-                    continue
-
-                t_right_c = max(t_right, 0.0)
-                piece1    = -(tau_k / 2.0) * (t_left ** (1 - alpha) + t_right_c ** (1 - alpha))
-                piece2    = (t_left ** (2 - alpha) - t_right_c ** (2 - alpha)) / (2.0 - alpha)
-                B_k       = 2.0 * (piece1 + piece2) / denom_B
-
-                denom_d2 = tau_kp1 + tau_k
-                if denom_d2 < 1e-30 or abs(B_k) < 1e-30:
-                    continue
-
-                c_km1 =  tau_kp1 / (tau_k   * denom_d2)
-                c_k   = -(tau_kp1 / (tau_k   * denom_d2) + tau_k / (tau_kp1 * denom_d2))
-                c_kp1 =  tau_k   / (tau_kp1  * denom_d2)
-
-                d2u  = np.zeros(n_x)
-                d2u += c_km1 * u_all[k - 1]
-                d2u += c_k   * u_all[k]
-                if k + 1 < n_t:
-                    d2u += c_kp1 * u_all[k + 1]
-
-                acc -= B_k * d2u
+                right_c = max(right, 0.0)
+                A_k = (left ** (1 - alpha) - right_c ** (1 - alpha)) / (tau_k * g2a)
+                acc += A_k * (u_all[k + 1] - u_all[k])
 
             return acc
 
@@ -923,59 +926,42 @@ class ParabolicPINNSolver:
         u[0,  0] = self._eval_bc_scalar(self.graph.edges[0][0], t_np[0])
         u[0, -1] = self._eval_bc_scalar(self.graph.edges[0][1], t_np[0])
 
-        f_all = np.zeros((n_t, n_x))
-        for ni in range(n_t):
-            t_t       = torch.full_like(x_all, t_np[ni])
-            f_all[ni] = self.physics.get_f_target(x_all, t_t, L).detach().numpy().flatten()
-
-        cd = 0.1 / dx ** 2
+        cd = self.physics.nu / dx ** 2 if hasattr(self.physics, 'nu') else 0.1 / dx ** 2
 
         for n in range(1, n_t):
             bcl = self._eval_bc_scalar(self.graph.edges[0][0], t_np[n])
             bcr = self._eval_bc_scalar(self.graph.edges[0][1], t_np[n])
 
-            b0   = l21_diagonal_coeff(n)
-            hist = l21_history(n, u)
-            f_n  = f_all[n]
+            b0      = l21_diagonal_coeff(n)
+            hist    = l21_history(n, u)
+            t_nsig  = (1.0 - sigma) * t_np[n - 1] + sigma * t_np[n]
 
-            ug     = u[n - 1].copy()
-            ug[0]  = bcl
-            ug[-1] = bcr
+            x_int_t  = torch.tensor(x_np[1:-1], dtype=torch.float64).view(-1, 1)
+            t_nsig_t = torch.full((n_x - 2, 1), t_nsig, dtype=torch.float64)
+            f_nsig   = self.physics.get_f_target(x_int_t, t_nsig_t, L).detach().numpy().flatten()
 
-            for _ in range(15):
-                uo  = ug.copy()
-                ux  = np.zeros(n_x)
-                uxx = np.zeros(n_x)
-                for j in range(1, n_x - 1):
-                    ux[j]  = (uo[j + 1] - uo[j - 1]) / (2 * dx)
-                    uxx[j] = (uo[j + 1] - 2 * uo[j] + uo[j - 1]) / dx ** 2
-                ux[0]   = (uo[1] - uo[0]) / dx
-                ux[-1]  = (uo[-1] - uo[-2]) / dx
-                uxx[0]  = uxx[1]
-                uxx[-1] = uxx[-2]
+            cd_impl = cd * sigma
+            cd_expl = cd * (1.0 - sigma)
 
-                ni2  = n_x - 2
-                sub  = np.full(ni2 - 1, -cd)
-                main = np.full(ni2, b0 + 2 * cd)
-                sup  = np.full(ni2 - 1, -cd)
-                rhs  = np.array([b0 * u[n - 1, j] - hist[j] - f_n[j] - ug[j] * ux[j]
-                                 for j in range(1, n_x - 1)])
-                rhs[0]  += cd * bcl
-                rhs[-1] += cd * bcr
+            ni2       = n_x - 2
+            sub       = np.full(ni2 - 1, -cd_impl)
+            main      = np.full(ni2,      b0 + 2.0 * cd_impl)
+            sup       = np.full(ni2 - 1, -cd_impl)
+            uxx_expl  = u[n - 1, 2:] - 2.0 * u[n - 1, 1:-1] + u[n - 1, :-2]
 
-                un      = np.zeros(n_x)
-                un[0]   = bcl
-                un[-1]  = bcr
-                un[1:-1] = self._solve_tridiag(sub, main, sup, rhs)
+            rhs        = b0 * u[n - 1, 1:-1] - hist[1:-1] + f_nsig + cd_expl * uxx_expl
+            rhs[0]    += cd_impl * bcl         + cd_expl * u[n - 1, 0]
+            rhs[-1]   += cd_impl * bcr         + cd_expl * u[n - 1, -1]
 
-                if np.max(np.abs(un - uo)) < 1e-10:
-                    ug = un
-                    break
-                ug = un
+            un         = np.zeros(n_x)
+            un[0]      = bcl
+            un[-1]     = bcr
+            un[1:-1]   = self._solve_tridiag(sub, main, sup, rhs)
 
-            u[n] = ug
-            if not np.all(np.isfinite(u[n])):
-                u[n] = np.nan_to_num(u[n], nan=0.0, posinf=0.0, neginf=0.0)
+            if not np.all(np.isfinite(un)):
+                un = np.nan_to_num(un, nan=0.0, posinf=0.0, neginf=0.0)
+
+            u[n] = un
 
         T_m, X_m = np.meshgrid(t_np, x_np, indexing='ij')
         self.anchor_X = torch.tensor(X_m.flatten(), dtype=torch.float64).view(-1, 1).to(device)

@@ -60,7 +60,7 @@ $$u(x,t) = e^x t^2$$
 | **Iterations** | 10,000 | **RAD Sampling** | Disabled |
 | **Architecture** | 60x4 | **L1 Points** | 0 |
 
-![Run 3 Result] <img width="1610" height="598" alt="L21_soft" src="https://github.com/user-attachments/assets/2bd535fb-fa8b-4ff7-a607-814a5858979d" />
+![Run 3 Result] <img width="1600" height="590" alt="image" src="https://github.com/user-attachments/assets/184b24d9-f8f9-4540-9acf-06db5f6f80cc" />
 
 
 

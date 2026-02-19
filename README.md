@@ -101,6 +101,12 @@ For $\alpha \in (0, 1)$:
 
 $$u(x,t) = t^2 \sin(\pi x)\, e^{-k(x - x_0)^2}$$
 
+<img width="1606" height="456" alt="image" src="https://github.com/user-attachments/assets/caa8e030-4160-410d-8d76-d30487ba4e7f" />
+
+<img width="1574" height="464" alt="image" src="https://github.com/user-attachments/assets/391cc8de-4ab1-47a8-9b2a-a4fd0d69f03b" />
+
+
+
 
 
 

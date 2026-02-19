@@ -49,3 +49,31 @@ $$u(x,t) = e^x t^2$$
 
 ![Run 2 Result] <img width="1586" height="602" alt="image" src="https://github.com/user-attachments/assets/9cf74608-d08f-46cb-a985-13b1b0e8877e" />
 
+
+
+#### Run 3: Soft Constraints
+| Parameter | Value | Parameter | Value |
+| :--- | :--- | :--- | :--- |
+| **Fractional Approximator** | L21-σ | **Strategy** | Dual |
+| **Constraint Type** | Soft | **Causal Training** | Disabled |
+| **Spatial / Temporal Points** | 100 / 100 | **NTK Balancing** | 200 iterations |
+| **Iterations** | 10,000 | **RAD Sampling** | Disabled |
+| **Architecture** | 60x4 | **L1 Points** | 0 |
+
+![Run 3 Result] <img width="1610" height="598" alt="L21_soft" src="https://github.com/user-attachments/assets/2bd535fb-fa8b-4ff7-a607-814a5858979d" />
+
+
+
+#### Run 4: Hard Constraints
+| Parameter | Value | Parameter | Value |
+| :--- | :--- | :--- | :--- |
+| **Fractional Approximator** | L21-σ | **Strategy** | Dual |
+| **Constraint Type** | Hard | **Causal Training** | Disabled |
+| **Spatial / Temporal Points** | 100 / 100 | **NTK Balancing** | 200 iterations |
+| **Iterations** | 10,000 | **RAD Sampling** | Disabled |
+| **Architecture** | 60x4 | **L1 Points** | 0 |
+
+
+
+
+

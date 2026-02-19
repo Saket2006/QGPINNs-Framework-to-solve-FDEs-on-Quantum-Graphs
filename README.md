@@ -105,6 +105,9 @@ $$u(x,t) = t^2 \sin(\pi x)\, e^{-k(x - x_0)^2}$$
 
 <img width="1574" height="464" alt="image" src="https://github.com/user-attachments/assets/391cc8de-4ab1-47a8-9b2a-a4fd0d69f03b" />
 
+<img width="1600" height="481" alt="image" src="https://github.com/user-attachments/assets/cd2a4a8b-9ed0-4abb-8fd7-97249df04f9d" />
+
+
 
 
 

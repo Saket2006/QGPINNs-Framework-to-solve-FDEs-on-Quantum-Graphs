@@ -75,5 +75,33 @@ $$u(x,t) = e^x t^2$$
 
 
 
+## Parabolic Problem: Problem 2
+
+### Governing Equation
+
+$$^C D_{0,t}^{\alpha} u(x,t) + u(x,t)u_x(x,t) - 0.1\, u_{xx}(x,t) = f(x,t)$$
+
+For $0 < x < 1$ and $0 < t \leq 1$.
+
+**Source Term & Conditions:**
+
+* **Source Term:**
+
+$$f(x,t) = \frac{2\,t^{2-\alpha}}{\Gamma(3-\alpha)}\sin(\pi x)\,e^{-k(x-x_0)^2} - t^4\sin^2(\pi x)\,e^{-2k(x-x_0)^2}\Big[\pi\cos(\pi x) - 2k(x-x_0)\sin(\pi x)\Big] - 0.1\,t^2\,e^{-k(x-x_0)^2}\Big[-\pi^2\sin(\pi x) - 4k\pi\cos(\pi x)(x-x_0) + \sin(\pi x)\big(4k^2(x-x_0)^2 - 2k\big)\Big]$$
+
+with $k = 20$, $x_0 = 0.5$
+
+* **Initial Condition:** $u(x, 0) = 0$
+
+* **Boundary Conditions:** $u(0, t) = 0, \quad u(1, t) = 0$
+
+**Exact Solution:**
+
+For $\alpha \in (0, 1)$:
+
+$$u(x,t) = t^2 \sin(\pi x)\, e^{-k(x - x_0)^2}$$
+
+
+
 
 

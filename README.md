@@ -1,4 +1,4 @@
-# Aim
+# Aim ####WILL CHANGE TO REFLECT NEW ENGINE
 
 In this project, we aim to solve Fractional Differential Equations (FDE) on metric graphs using Physics-Informed Neural Networks (PINNs). We explore a wide variety of methods to optimize and reduce the errors of the output, utilizing $L^2$ errors on manufactured solutions to evaluate the effectiveness of the neural network.
 

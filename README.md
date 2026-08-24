@@ -4,7 +4,7 @@ This repository contains the source code for the QGPINNs framework. The QGPINNs 
 
 ## Framework Architecture
 
-To ensure that the engine remains modular and is adaptable to a wide variety of problems, we separate the engine containing the neural network architecture and the run script which defines the governing physics and metric graph topology.  [The QGPINNs engine can be accessed here](Engine/QGPINNs_Engine). We also provide all the run scripts used in the paper. 
+To ensure that the engine remains modular and is adaptable to a wide variety of problems, we separate the engine containing the neural network architecture and the run script which defines the governing physics and metric graph topology.  The QGPINNs engine can be accessed [here](Engine/QGPINNs_Engine). We also provide all the run scripts used in the paper. All run scripts used in Section 3 can be accessed [here](Section_3_Run_Scripts). The numerical section details problems based on real world topologies, the corresponding run scripts can be found [here](Section_5_Run_Scripts).
 
 
 

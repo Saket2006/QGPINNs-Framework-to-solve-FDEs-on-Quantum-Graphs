@@ -25,6 +25,6 @@
 QGPINNs/
 ├── Engine/
 │   └── QGPINNs_Engine/      # Core neural network solver engines & fractional matrix assembly
-├── Section_3_Run_Scripts/   # Theoretical benchmarks & ablation studies (Soft/Hard BCs, RFF, Z(t))
+├── Section_3_Run_Scripts/   # Theoretical benchmarks & ablation studies (Adaptive lambda, Fourier, Z(t))
 ├── Section_5_Run_Scripts/   # Real-world application scripts (Tadpole, Drainage Network, IEEE-14)
 └── README.md

@@ -5,7 +5,7 @@ import math
 import torch
 import numpy as np
 
-sys.path.insert(0, '/kaggle/working')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'Engine'))
 from QGPINNs_Engine import ParabolicPINNSolver, DEFAULT_PARABOLIC_ARCH, device, NET_DTYPE
 
 def seed_everything(seed=42):

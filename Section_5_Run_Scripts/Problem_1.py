@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from scipy.special import gamma
 
-sys.path.insert(0, '/kaggle/working')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'Engine'))
 from QGPINNs_Engine import EllipticPINNSolver, device
 
 def seed_everything(seed=42):

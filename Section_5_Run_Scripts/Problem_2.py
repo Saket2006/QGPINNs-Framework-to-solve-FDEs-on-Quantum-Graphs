@@ -8,9 +8,9 @@ import numpy as np
 import torch
 from scipy.special import gamma
 
-if '--check' not in sys.argv:
-    sys.path.insert(0, '/kaggle/working')
-    from QGPINNs_Engine import ParabolicPINNSolver, device
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'Engine'))
+from QGPINNs_Engine import ParabolicPINNSolver, device
 
 
 def seed_everything(seed=42):

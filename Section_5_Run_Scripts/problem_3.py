@@ -6,7 +6,7 @@ import torch
 import numpy as np
 
 sys.path.insert(0, '/kaggle/working')
-from temp_1 import ParabolicPINNSolver, DEFAULT_PARABOLIC_ARCH, device, NET_DTYPE
+from QGPINNs_Engine import ParabolicPINNSolver, DEFAULT_PARABOLIC_ARCH, device, NET_DTYPE
 
 def seed_everything(seed=42):
     random.seed(seed)

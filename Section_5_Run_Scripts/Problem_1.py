@@ -8,7 +8,7 @@ import torch
 from scipy.special import gamma
 
 sys.path.insert(0, '/kaggle/working')
-from PINN_Solver import EllipticPINNSolver, device
+from QGPINNs_Engine import EllipticPINNSolver, device
 
 def seed_everything(seed=42):
     random.seed(seed)

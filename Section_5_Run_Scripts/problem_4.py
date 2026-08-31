@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from PINN_Solver import (
+from QGPINNs_Engine import (
     ParabolicPINNSolver, seed_everything, device, NET_DTYPE, DEFAULT_PARABOLIC_ARCH
 )
 

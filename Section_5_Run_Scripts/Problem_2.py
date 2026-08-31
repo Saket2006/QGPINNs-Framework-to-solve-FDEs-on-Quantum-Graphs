@@ -10,7 +10,7 @@ from scipy.special import gamma
 
 if '--check' not in sys.argv:
     sys.path.insert(0, '/kaggle/working')
-    from temp_1 import ParabolicPINNSolver, device
+    from QGPINNs_Engine import ParabolicPINNSolver, device
 
 
 def seed_everything(seed=42):

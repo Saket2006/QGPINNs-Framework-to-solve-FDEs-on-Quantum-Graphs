@@ -2,7 +2,7 @@ import os
 import math
 import numpy as np
 import torch
-from PINN_Solver import ParabolicPINNSolver, NET_DTYPE, device, seed_everything, write_rows
+from QGPINNs_Engine import ParabolicPINNSolver, NET_DTYPE, device, seed_everything, write_rows
 
 ALPHA = 0.5
 EPOCHS = 10000

@@ -106,7 +106,7 @@ See the run scripts for full graph/physics definitions for each benchmark proble
 
 Mass conservation within the system.
 
-| Time | $\hat{M}(\hat{t})-\hat{M}(0)$ | $\mathcal{I}^\gamma[\hat{Q}_{\text{net}}](\hat{t})$ | Rel. Error (%) |
+| Time | $\hat{M}(\hat{t})-\hat{M}(0)$ | $\mathcal I^\gamma[\hat{Q}_{\mathrm{net}}](\hat{t})$ | Rel. Error (%) |
 | :---: | :---: | :---: | :---: |
 | $\hat{t}=0.20$ | $5.9106 \times 10^{-1}$ | $5.9061 \times 10^{-1}$ | 0.077 |
 | $\hat{t}=0.50$ | $8.6204 \times 10^0$ | $8.6190 \times 10^0$ | 0.016 |

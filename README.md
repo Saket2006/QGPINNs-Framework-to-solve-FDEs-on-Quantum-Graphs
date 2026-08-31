@@ -33,6 +33,7 @@ QGPINNs/
 │   └── QGPINNs_Engine.py       # Core solver engine: PINN architecture, fractional matrix assembly, vertex coupling
 ├── Section_3_Run_Scripts/      # Theoretical benchmarks & ablation studies (adaptive λ, Fourier features, Z(t))
 ├── Section_5_Run_Scripts/      # Applications: tadpole graph, drainage network, IEEE 14-bus topology
+├── assets/                     # Figures used in this README
 ├── requirements.txt
 ├── LICENSE
 └── README.md
@@ -43,7 +44,7 @@ QGPINNs/
 ## Installation
 
 ```bash
-git https://github.com/Saket2006/QGPINNs-Framework-to-solve-FDEs-on-Quantum-Graphs.git
+git clone https://github.com/Saket2006/QGPINNs-Framework-to-solve-FDEs-on-Quantum-Graphs.git
 cd QGPINNs-Framework-to-solve-FDEs-on-Quantum-Graphs
 python3 -m venv venv
 source venv/bin/activate      # Windows: venv\Scripts\activate
@@ -58,7 +59,7 @@ Each run script in `Section_3_Run_Scripts/` and `Section_5_Run_Scripts/` is self
 
 ```bash
 cd Section_5_Run_Scripts
-python Problem_1.py
+python problem_1.py
 ```
 
 Minimal example using the engine directly:
@@ -79,9 +80,58 @@ See the run scripts for full graph/physics definitions for each benchmark proble
 
 ## Results
 
-Validation of Telegrpah Equation system embedded on IEEE-14 Bus network (`Section_5_Run_Scripts/problem_4.py`).
+### Comparison of accuracy and computational efficiency of optimization schemes (`Section_5_Run_Scripts/problem_1.py`).
 
-### Physical-Consistency and Energy Diagnostics Across Fractional Orders γ
+| Variant | Global Relative $L_2$ Error | GPU Memory (MB) | GPU-S |
+| :--- | :---: | :---: | :---: |
+| **Variant 1** | $2.62 \times 10^{-2}$ | 270 | 250 |
+| **Variant 2** | $2.51 \times 10^{-2}$ | 270 | 256 |
+| **Variant 3** | $1.33 \times 10^{-4}$ | 270 | 340 |
+| **Variant 4** | $8.50 \times 10^{-5}$ | 348 | 391 |
+
+**Variant 1:** Standard PINN.  
+**Variant 2:** Adaptive weighting enabled.  
+**Variant 3:** Adaptive weighting and singularity capture enabled.  
+**Variant 4:** Adaptive weighting, singularity capture and Fourier embedding enabled.
+
+### Comparison of Auxiliary and Unified Meshes (`Section_5_Run_Scripts/problem_2.py`)
+
+| Variant | Global Relative $L_2$ Error | GPU Memory (MB) | GPU-S |
+| :--- | :---: | :---: | :---: |
+| **Unified Mesh** | $7.73 \times 10^{-4}$ | 1146 | 473.6 |
+| **Auxiliary Mesh (50 points)** | $5.83 \times 10^{-4}$ | 6814 | 2909.3 |
+| **Auxiliary Mesh (25 points)** | $7.48 \times 10^{-4}$ | 3932 | 1694.0 |
+
+### Validation of time fractional burger's on an open channel drainage system (`Section_5_Run_Scripts/problem_3.py`).
+
+Mass conservation within the system.
+
+| Time | $\hat{M}(\hat{t})-\hat{M}(0)$ | $\mathcal{I}^\gamma[\hat{Q}_{\text{net}}](\hat{t})$ | Rel. Error (%) |
+| :---: | :---: | :---: | :---: |
+| $\hat{t}=0.20$ | $5.9106 \times 10^{-1}$ | $5.9061 \times 10^{-1}$ | 0.077 |
+| $\hat{t}=0.50$ | $8.6204 \times 10^0$ | $8.6190 \times 10^0$ | 0.016 |
+| $\hat{t}=0.80$ | $7.4173 \times 10^0$ | $7.3766 \times 10^0$ | 0.549 |
+| $\hat{t}=1.00$ | $4.0244 \times 10^0$ | $4.0561 \times 10^0$ | 0.790 |
+
+Adherence to junction constraints.
+
+| Junction | Time | $\hat{Q}_{in}$ | $\hat{Q}_{out}$ | Rel. Residual (%) |
+| :---: | :---: | :---: | :---: | :---: |
+| $E$ | $\hat{t}=0.20$ | $2.0283 \times 10^{-2}$ | $2.1648 \times 10^{-2}$ | 6.308 |
+| $E$ | $\hat{t}=0.50$ | $1.6337 \times 10^1$ | $1.6341 \times 10^1$ | 0.026 |
+| $E$ | $\hat{t}=0.80$ | $7.8457 \times 10^0$ | $7.8419 \times 10^0$ | 0.048 |
+| $E$ | $\hat{t}=1.00$ | $2.0642 \times 10^0$ | $2.0688 \times 10^0$ | 0.224 |
+| $F$ | $\hat{t}=0.50$ | $1.1534 \times 10^1$ | $1.1523 \times 10^1$ | 0.093 |
+| $F$ | $\hat{t}=0.80$ | $1.4285 \times 10^1$ | $1.4284 \times 10^1$ | 0.006 |
+| $F$ | $\hat{t}=1.00$ | $5.1354 \times 10^0$ | $5.1481 \times 10^0$ | 0.248 |
+
+Wave fluctuation heatmap at t=5.0s
+
+<img src="assets/Drainage_System_Heatmap.png" width="700">
+
+### Validation of Telegrpah Equation system embedded on IEEE-14 Bus network (`Section_5_Run_Scripts/problem_4.py`).
+
+Physical-Consistency and Energy Diagnostics Across Fractional Orders γ.
 
 | Metric / Quantity | γ = 0.50 | γ = 0.75 | γ = 1.00 |
 |---|---|---|---|

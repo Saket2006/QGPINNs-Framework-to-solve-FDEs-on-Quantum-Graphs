@@ -13,7 +13,7 @@ import networkx as nx
 from scipy.linalg import solve_banded
 
 MATRIX_DTYPE = torch.float64
-NET_DTYPE = torch.float64
+NET_DTYPE = torch.float32
 if torch.cuda.is_available():
     device = torch.device('cuda')
 elif torch.mps.is_available():
@@ -40,7 +40,10 @@ def write_rows(path, rows):
     if not rows:
         return
     with open(path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        fields = []
+        for r in rows:
+            fields += [k for k in r.keys() if k not in fields]
+        writer = csv.DictWriter(f, fieldnames=fields, restval='')
         writer.writeheader()
         writer.writerows(rows)
 
@@ -142,7 +145,6 @@ class SplitPINN_Net(nn.Module):
 
 
 class SDCNet(nn.Module):
-
     def __init__(self, smooth_dim, raw_dim, hidden_dim=64, hidden_layers=3, use_fourier=False, fourier_dim=64,
                  fourier_sigma=1.0, fourier_sampling='sobol'):
         super().__init__()
@@ -292,6 +294,74 @@ def _compute_l1_matrix_torch(alpha, grid_t):
     return mat
 
 
+def _compute_l21sigma_matrix_torch(alpha, grid_t, sigma):
+    grid_t = grid_t.to(MATRIX_DTYPE)
+    n = grid_t.shape[0]
+    if n <= 1:
+        return torch.zeros(n, n, dtype=MATRIX_DTYPE, device=grid_t.device)
+
+    sigma_t = torch.as_tensor(sigma, dtype=MATRIX_DTYPE, device=grid_t.device)
+    tau = grid_t[1:] - grid_t[:-1]
+    t_shift = grid_t[:-1] + sigma_t * tau
+
+    eps = torch.tensor(1e-14, dtype=MATRIX_DTYPE, device=grid_t.device)
+    p1 = 1.0 - alpha
+    p2 = 2.0 - alpha
+    g1 = torch.exp(torch.lgamma(1.0 - alpha))
+
+    m = n - 1
+    rows_i, cols_k = torch.tril_indices(m, m, offset=0, device=grid_t.device)
+
+    tn = t_shift[rows_i]
+    gk = grid_t[cols_k]
+    gk1 = grid_t[cols_k + 1]
+
+    diff0 = torch.clamp(tn - gk, min=eps)
+    diff1 = tn - gk1
+    pos1 = diff1 > 0
+    diff1c = torch.clamp(diff1, min=eps)
+
+    term1 = diff0 ** p1
+    term2 = torch.where(pos1, diff1c ** p1, torch.zeros_like(diff1c))
+    A_nk = (term1 - term2) / p1
+
+    is_k0 = cols_k == 0
+    mat = torch.zeros((n, n), dtype=MATRIX_DTYPE, device=grid_t.device)
+
+    row0 = rows_i[is_k0] + 1
+    w0 = (A_nk / g1)[is_k0]
+    tau0 = tau[0]
+    mat.index_put_((row0, torch.ones_like(row0)), w0 / tau0, accumulate=True)
+    mat.index_put_((row0, torch.zeros_like(row0)), -w0 / tau0, accumulate=True)
+
+    kpos = ~is_k0
+    i_p, k_p = rows_i[kpos], cols_k[kpos]
+    A_p = A_nk[kpos]
+    tn_p, gk_p, gk1_p = tn[kpos], gk[kpos], gk1[kpos]
+    diff0_p, diff1_p, pos1_p = diff0[kpos], diff1[kpos], pos1[kpos]
+
+    term3 = diff0_p ** p2
+    term4 = torch.where(pos1_p, torch.clamp(diff1_p, min=eps) ** p2, torch.zeros_like(diff1_p))
+    part1 = (2.0 * tn_p - gk_p - gk1_p) * A_p
+    part2 = (2.0 / p2) * (term3 - term4)
+    B_p = part1 - part2
+
+    tau_k = tau[k_p]
+    tau_km1 = tau[k_p - 1]
+    denom = tau_k + tau_km1
+
+    c1 = (A_p + B_p / denom) / g1
+    c2 = -B_p / denom / g1
+
+    row_p = i_p + 1
+    mat.index_put_((row_p, k_p + 1), c1 / tau_k, accumulate=True)
+    mat.index_put_((row_p, k_p), -c1 / tau_k, accumulate=True)
+    mat.index_put_((row_p, k_p), c2 / tau_km1, accumulate=True)
+    mat.index_put_((row_p, k_p - 1), -c2 / tau_km1, accumulate=True)
+
+    return mat
+
+
 class _PINNSolverBase:
     def __init__(self, graph, physics):
         self.graph = graph
@@ -335,13 +405,19 @@ class _PINNSolverBase:
         self.inverse_enabled = False
         self.inverse_parameter_names = []
         self.inverse_param_bounds = {}
+        self.inverse_initial_guesses = {}
         self.inverse_include_alpha = False
         self.inverse_alpha_bounds = (1.05, 1.95)
+        self._inverse_initial_raw = {}
+        self.global_inv_params = None
+        self.inverse_lr_scale = 10.0
         self.lambda_data = 1.0
         self.inverse_data = {}
         self.last_data_loss = 0.0
         self.use_singularity_capture = False
+        self.singularity_mode = 'feature'
         self.xi_raw = nn.Parameter(torch.tensor(0.0, dtype=NET_DTYPE))
+        self.xi_tied_to_alpha = False
         self.xi_loss_adaptive = True
         self.xi_loss_ref = 0.1
         self.xi_loss_floor = 1e-05
@@ -373,8 +449,11 @@ class _PINNSolverBase:
         return self
 
     def set_singularity_capture(self, enabled=True, xi_init=None, xi_loss_adaptive=True, xi_loss_ref=0.1,
-                                xi_loss_floor=1e-05):
+                                xi_loss_floor=1e-05, mode='feature'):
         self.use_singularity_capture = enabled
+        self.singularity_mode = str(mode).lower()
+        if self.singularity_mode not in ('feature', 'multiplicative'):
+            raise ValueError("singularity mode must be 'feature' or 'multiplicative'.")
         self.xi_loss_adaptive = xi_loss_adaptive
         self.xi_loss_ref = float(xi_loss_ref)
         self.xi_loss_floor = float(xi_loss_floor)
@@ -384,15 +463,30 @@ class _PINNSolverBase:
             self.xi_raw = nn.Parameter(torch.tensor(np.log(init), dtype=NET_DTYPE))
         return self
 
-    def set_lr(self, lr=0.0005, min_lr=1e-06, xi_lr_scale=0.1, xi_lr_scale_phase2=0.01):
+    def set_xi_tied_to_alpha(self, enabled=True):
+        self.xi_tied_to_alpha = bool(enabled)
+        return self
+
+    def set_data_dynamic_weighting(self, enabled=True, lambda_min=1e-3, lambda_max=1000.0):
+        self.data_dynamic_weighting = bool(enabled)
+        self.data_lambda_min = float(lambda_min)
+        self.data_lambda_max = float(lambda_max)
+        return self
+
+    def set_lr(self, lr=0.0005, min_lr=1e-06, xi_lr_scale=0.1, xi_lr_scale_phase2=0.01, inverse_lr_scale=10.0):
         self.lr = lr
         self.scheduler_min_lr = min_lr
         self.xi_lr_scale = xi_lr_scale
         self.xi_lr_scale_phase2 = xi_lr_scale_phase2
+        self.inverse_lr_scale = inverse_lr_scale
+        return self
+
+    def set_gradient_clipping(self, max_norm=1.0, separate_scalars=False):
+        self.clip_max_norm = float(max_norm)
+        self.separate_scalar_clip = bool(separate_scalars)
         return self
 
     def set_dense_constraint_enforcement(self, enabled=True, factor=4, only_custom_flux=True):
-       
         self.dense_constraint_enabled = bool(enabled)
         self.dense_constraint_factor = max(int(factor), 1)
         self.dense_constraint_only_custom_flux = bool(only_custom_flux)
@@ -419,14 +513,16 @@ class _PINNSolverBase:
         return torch.tensor(t_ref, dtype=NET_DTYPE, device=device).view(-1, 1)
 
     def set_inverse_problem(self, parameter_names=None, include_alpha=False, param_bounds=None,
-                            alpha_bounds=(1.05, 1.95), data_weight=1.0, initial_guesses=None):
+                            alpha_bounds=(1.05, 1.95), data_weight=1.0, initial_guesses=None, shared=True):
         self.inverse_enabled = True
+        self.inverse_shared = bool(shared)
         self.inverse_parameter_names = list(parameter_names or [])
         self.inverse_param_bounds = dict(param_bounds or {})
         self.inverse_initial_guesses = dict(initial_guesses or {})
         self.inverse_include_alpha = bool(include_alpha)
         self.inverse_alpha_bounds = tuple(alpha_bounds)
         self.lambda_data = float(data_weight)
+        self._data_weight0 = float(data_weight)
         return self
 
     @staticmethod
@@ -451,6 +547,43 @@ class _PINNSolverBase:
         cfg = m['inv_params'][name]
         return self._to_bounded(cfg['raw'], cfg['bounds'])
 
+    def _reset_inverse_parameters(self):
+        if not getattr(self, 'inverse_enabled', False):
+            return
+        for m in self.models.values():
+            for cfg in m.get('inv_params', {}).values():
+                if 'raw0' in cfg:
+                    with torch.no_grad():
+                        cfg['raw'].copy_(cfg['raw0'])
+
+    def _build_inverse_params(self, edge_idx, phys_i):
+        inv_params = {}
+        names = list(self.inverse_parameter_names)
+        if self.inverse_include_alpha and 'alpha' not in names:
+            names.append('alpha')
+        for pname in names:
+            if not hasattr(phys_i, pname):
+                raise AttributeError(f"Physics on edge {edge_idx} has no attribute '{pname}'.")
+            bnd = self.inverse_alpha_bounds if pname == 'alpha' else self.inverse_param_bounds.get(pname, None)
+            init_val = float(self.inverse_initial_guesses.get(pname, float(getattr(phys_i, pname))))
+            raw = nn.Parameter(self._raw_from_value(init_val, bnd).to(device))
+            inv_params[pname] = {'raw': raw, 'bounds': bnd, 'raw0': raw.detach().clone()}
+            self._inverse_initial_raw[pname] = raw.detach().clone()
+        return inv_params
+
+    def _report_inverse_start(self):
+        if not getattr(self, 'inverse_enabled', False):
+            return
+        seen = set()
+        for i, m in self.models.items():
+            for name, cfg in m.get('inv_params', {}).items():
+                if id(cfg['raw']) in seen:
+                    continue
+                seen.add(id(cfg['raw']))
+                val = float(self._to_bounded(cfg['raw'], cfg['bounds']).detach().cpu())
+                scope = 'all edges' if getattr(self, 'inverse_shared', True) else f'edge {i}'
+                print(f'  [inverse] {name} ({scope}) starts at {val:.4f}  bounds={cfg["bounds"]}')
+
     def _refresh_edge_physics_parameters(self, edge_idx):
         m = self.models[edge_idx]
         if 'inv_params' not in m:
@@ -470,19 +603,40 @@ class _PINNSolverBase:
                 setattr(m['physics'], name, val)
         return out
 
+    def _xi_is_tied(self):
+        return bool(getattr(self, 'xi_tied_to_alpha', False)) and bool(getattr(self, 'inverse_enabled', False)) \
+            and bool(getattr(self, 'inverse_include_alpha', False))
+
     def _all_params(self):
-        p = [p for m in self.models.values() for p in m['net'].parameters()]
-        if getattr(self, 'use_singularity_capture', False):
-            p = p + [self.xi_raw]
+        p = [p for m in self.models.values() for p in m['net'].parameters() if p.requires_grad]
+        if getattr(self, 'use_singularity_capture', False) and not self._xi_is_tied():
+            if self.xi_raw.requires_grad:
+                p = p + [self.xi_raw]
         if self.inverse_enabled:
             seen_inv = set()
             for m in self.models.values():
                 if 'inv_params' in m:
                     for cfg in m['inv_params'].values():
-                        if cfg['raw'] not in seen_inv:
+                        if cfg['raw'].requires_grad and cfg['raw'] not in seen_inv:
                             p.append(cfg['raw'])
                             seen_inv.add(cfg['raw'])
         return p
+
+
+    def _split_clip_groups(self, params):
+        net_params, scalar_params = [], []
+        seen_inv = set()
+        for m in self.models.values():
+            if 'inv_params' in m:
+                for cfg in m['inv_params'].values():
+                    seen_inv.add(cfg['raw'])
+        xi = self.xi_raw if (getattr(self, 'use_singularity_capture', False) and not self._xi_is_tied()) else None
+        for p in params:
+            if (xi is not None and p is xi) or p in seen_inv:
+                scalar_params.append(p)
+            else:
+                net_params.append(p)
+        return net_params, scalar_params
 
     def _reinit_weights(self, seed=None):
         if seed is not None:
@@ -495,7 +649,10 @@ class _PINNSolverBase:
                     nn.init.zeros_(layer.bias)
         self.lambda_bc = 1.0
         self._frozen_lambda = None
-        for attr in ('_lagrange_ema_grad', '_lagrange_ema_bdmm'):
+        self._reset_inverse_parameters()
+        if getattr(self, 'inverse_enabled', False):
+            self.lambda_data = float(getattr(self, '_data_weight0', self.lambda_data))
+        for attr in ('_lagrange_ema_grad', '_lagrange_ema_bdmm', '_lagrange_ema_data'):
             if hasattr(self, attr):
                 delattr(self, attr)
         if getattr(self, 'use_singularity_capture', False):
@@ -512,10 +669,11 @@ class _PINNSolverBase:
         gb2 = sum(float((g.detach() ** 2).sum().cpu()) for g in g_bc if g is not None)
         return math.sqrt(gp2), math.sqrt(gb2)
 
-    def _apply_target_lambda_update(self, lam_target, ema_key):
+    def _apply_target_lambda_update(self, lam_target, ema_key, attr='lambda_bc',
+                                    lam_min=None, lam_max=None):
         rho = float(np.clip(getattr(self, 'adaptive_rate', 0.05), 1e-6, 1.0))
-        lam_min = float(getattr(self, 'adaptive_lambda_min', 1e-3))
-        lam_max = float(getattr(self, 'adaptive_lambda_max', 100.0))
+        lam_min = float(getattr(self, 'adaptive_lambda_min', 1e-3)) if lam_min is None else float(lam_min)
+        lam_max = float(getattr(self, 'adaptive_lambda_max', 100.0)) if lam_max is None else float(lam_max)
         beta = float(getattr(self, 'adaptive_ema_beta', 0.90))
 
         lam_target = float(np.clip(lam_target, lam_min, lam_max))
@@ -523,8 +681,9 @@ class _PINNSolverBase:
         smoothed_target = math.exp(beta * math.log(prev_target) + (1 - beta) * math.log(lam_target))
         setattr(self, ema_key, smoothed_target)
 
-        log_lam = (1 - rho) * math.log(self.lambda_bc) + rho * math.log(smoothed_target)
-        self.lambda_bc = float(np.clip(math.exp(log_lam), lam_min, lam_max))
+        cur = float(getattr(self, attr))
+        log_lam = (1 - rho) * math.log(cur) + rho * math.log(smoothed_target)
+        setattr(self, attr, float(np.clip(math.exp(log_lam), lam_min, lam_max)))
 
     def _update_gradient_ratio_v2(self, lp, ln, params):
         gp, gb = self._v2_grad_norms(lp, ln, params)
@@ -539,6 +698,27 @@ class _PINNSolverBase:
         self._apply_target_lambda_update(lam_target, ema_key='_lagrange_ema_bdmm')
         return ln_val, self.lambda_bc
 
+    def _inverse_scalar_params(self, params=None):
+        found = []
+        seen = set()
+        for m in self.models.values():
+            for cfg in m.get('inv_params', {}).values():
+                p = cfg['raw']
+                if p.requires_grad and id(p) not in seen:
+                    found.append(p)
+                    seen.add(id(p))
+        return found if found else (params or [])
+
+    def _update_data_gradient_ratio_v2(self, lp, ld, params):
+        inv_params = self._inverse_scalar_params(params)
+        gp, gd = self._v2_grad_norms(lp, ld, inv_params)
+        lam_target = gp / max(gd, 1e-12)
+        lam_min = float(getattr(self, 'data_lambda_min', 1e-3))
+        lam_max = float(getattr(self, 'data_lambda_max', 1000.0))
+        self._apply_target_lambda_update(lam_target, ema_key='_lagrange_ema_data',
+                                         attr='lambda_data', lam_min=lam_min, lam_max=lam_max)
+        return gp, gd, self.lambda_data
+
     def _compose_loss(self, lp, ln):
         lam_junc = getattr(self, 'lambda_junc', 1.0)
         loss_junc = getattr(self, '_current_loss_junc', 0.0)
@@ -548,6 +728,17 @@ class _PINNSolverBase:
         if getattr(self, 'l_data_total', None) is not None:
             loss = loss + self.l_data_total
         return loss
+
+    def _selection_metric(self, lp, ln):
+        if not getattr(self, 'inverse_enabled', False):
+            return float(self._compose_loss(lp, ln).detach())
+        lam_junc = getattr(self, 'lambda_junc', 1.0)
+        loss_junc = getattr(self, '_current_loss_junc', 0.0)
+        val = float(lp.detach()) + float(ln.detach()) + lam_junc * float(
+            loss_junc.detach() if torch.is_tensor(loss_junc) else loss_junc)
+        if getattr(self, 'ld_total', None) is not None:
+            val += float(getattr(self, '_data_weight0', 1.0)) * float(self.ld_total.detach())
+        return val
 
     def _run_lbfgs(self, params):
         pre_w = [p.data.clone() for p in params]
@@ -591,7 +782,7 @@ class _PINNSolverBase:
         if not hasattr(self, '_lam_hist'): self._lam_hist = []
         if not hasattr(self, '_loss_hist'): self._loss_hist = []
         params = self._all_params()
-        use_val = self.validation_func is not None
+        use_val = (self.validation_func is not None) and (not self.inverse_enabled)
         best_l, best_w, best_lam = (float('inf'), None, self.lambda_bc)
         total = epoch_offset + epochs
         use_xi = getattr(self, 'use_singularity_capture', False)
@@ -645,19 +836,30 @@ class _PINNSolverBase:
                     self._update_bdmm_v2(lp, ln_for_adapt)
                 elif active == 'gradient_ratio_v2':
                     self._update_gradient_ratio_v2(lp, ln_for_adapt, params)
+                if getattr(self, 'data_dynamic_weighting', False) and self.inverse_enabled \
+                        and getattr(self, 'ld_total', None) is not None:
+                    self._update_data_gradient_ratio_v2(lp, self.ld_total, params)
                 self._lam_hist.append((ep, self.lambda_bc))
             loss = self._compose_loss(lp, ln)
             if ep > 0 and ep % 10 == 0:
                 self._loss_hist.append((ep, loss.item()))
-            metric = self._eval_l2() if use_val else loss.item()
+            metric = self._eval_l2() if use_val else self._selection_metric(lp, ln)
             if metric < best_l:
                 best_l = metric
                 best_w = [p.data.clone() for p in params]
                 best_lam = self.lambda_bc
-            if global_best is not None and metric < global_best['loss']:
+            global_best_eligible = (not self.inverse_enabled) or (phase2 is None) or (le >= phase2)
+            if global_best is not None and global_best_eligible and metric < global_best['loss']:
                 global_best.update(loss=metric, params=[p.data.clone() for p in params], lam=self.lambda_bc)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
+            clip = float(getattr(self, 'clip_max_norm', 1.0))
+            if getattr(self, 'separate_scalar_clip', False):
+                net_params_clip, scalar_params_clip = self._split_clip_groups(params)
+                torch.nn.utils.clip_grad_norm_(net_params_clip, max_norm=clip)
+                if scalar_params_clip:
+                    torch.nn.utils.clip_grad_norm_(scalar_params_clip, max_norm=clip)
+            else:
+                torch.nn.utils.clip_grad_norm_(params, max_norm=clip)
             if use_xi and getattr(self, 'xi_loss_adaptive', True) and hasattr(self, '_xi_lr_base'):
                 ref = getattr(self, 'xi_loss_ref', 0.1)
                 floor = getattr(self, 'xi_loss_floor', 1e-05)
@@ -669,8 +871,14 @@ class _PINNSolverBase:
             optimizer.step()
             scheduler.step()
             if le % 500 == 0:
-                xi_s = f'  xi={torch.exp(self.xi_raw).item():.4f}' if use_xi else ''
+                if use_xi and self._xi_is_tied():
+                    _alpha_now = self._edge_param_value(next(iter(self.models)), 'alpha')
+                    xi_s = f'  xi(=alpha)={float(_alpha_now.detach().cpu()):.4f}' if _alpha_now is not None else ''
+                else:
+                    xi_s = f'  xi={torch.exp(self.xi_raw).item():.4f}' if use_xi else ''
                 data_s = f' | Data={self.last_data_loss:.3e}' if self.inverse_enabled and self.inverse_data else ''
+                if getattr(self, 'data_dynamic_weighting', False) and self.inverse_enabled:
+                    data_s += f' λd={self.lambda_data:.3f}'
                 junc_now = getattr(self, '_current_loss_junc', 0.0)
                 junc_s = f' | JUNC={float(junc_now.detach().cpu() if torch.is_tensor(junc_now) else junc_now):.3e}' if self._has_custom_flux() else ''
                 print(
@@ -693,7 +901,7 @@ class _PINNSolverBase:
                 m2 = self._eval_l2()
             else:
                 lp2, ln2 = self.compute_losses()[:2]
-                m2 = self._compose_loss(lp2, ln2).item()
+                m2 = self._selection_metric(lp2, ln2)
             if m2 < global_best['loss']:
                 global_best.update(loss=m2, params=[p.data.clone() for p in params], lam=self.lambda_bc)
         return best_l
@@ -706,7 +914,7 @@ class _PINNSolverBase:
             self.compile()
         params = self._all_params()
         opt = self._make_optimizer(params)
-        sch = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs + 1, eta_min=self.scheduler_min_lr)
+        sch = self._make_scheduler(opt, epochs + 1)
         return self._train_loop(epochs, strategy, use_lbfgs, opt, sch)
 
     def train_multistart(self, epochs=4000, strategy='dual', use_lbfgs=True, n_starts=3, seed_base=0, probe_epochs=500,
@@ -748,20 +956,40 @@ class _PINNSolverBase:
         global_best = dict(loss=float('inf'), params=None, lam=1.0)
         bp_score, bp_params, bp_lam = (float('inf'), None, 1.0)
 
+        alpha_start_values = None
+        if self.inverse_enabled and self.inverse_include_alpha:
+            lo, hi = self.inverse_alpha_bounds
+            mid = 0.5 * (lo + hi)
+            guess = float(self.inverse_initial_guesses.get('alpha', mid))
+            candidates = [guess, mid, lo + 0.20 * (hi - lo), hi - 0.20 * (hi - lo), lo + 0.35 * (hi - lo)]
+            alpha_start_values = [float(candidates[i % len(candidates)]) for i in range(n_starts)]
+
         for s in range(n_starts):
             seed = seed_base * 100 + s * 37
             self._reinit_weights(seed=seed)
+            if alpha_start_values is not None:
+                a0 = alpha_start_values[s]
+                for m in self.models.values():
+                    cfg = m.get('inv_params', {}).get('alpha')
+                    if cfg is not None:
+                        with torch.no_grad():
+                            cfg['raw'].copy_(self._raw_from_value(a0, cfg['bounds']))
             opt = self._make_optimizer(params)
-            sch = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=probe_epochs + 1, eta_min=self.scheduler_min_lr)
-            self._train_loop(probe_epochs, strategy, False, opt, sch, epoch_offset=0, global_best=global_best)
-            if self.validation_func:
+            sch = self._make_scheduler(opt, probe_epochs + 1)
+            self._train_loop(probe_epochs, strategy, False, opt, sch, epoch_offset=0,
+                             global_best=None if self.inverse_enabled else global_best)
+            if self.validation_func and not self.inverse_enabled:
                 score = self._eval_l2()
             else:
                 lp_s, ln_s = self.compute_losses()[:2]
-                score = self._compose_loss(lp_s, ln_s).item()
+                score = self._selection_metric(lp_s, ln_s)
             lbl = 'L2' if self.validation_func else 'loss'
-            xi_s = f'  xi={torch.exp(self.xi_raw).item():.4f}' if getattr(self, 'use_singularity_capture',
-                                                                          False) else ''
+            if getattr(self, 'use_singularity_capture', False) and self._xi_is_tied():
+                _alpha_now = self._edge_param_value(next(iter(self.models)), 'alpha')
+                xi_s = f'  xi(=alpha)={float(_alpha_now.detach().cpu()):.4f}' if _alpha_now is not None else ''
+            else:
+                xi_s = f'  xi={torch.exp(self.xi_raw).item():.4f}' if getattr(self, 'use_singularity_capture',
+                                                                              False) else ''
             print(f'  probe {s + 1}/{n_starts}  seed={seed}  {lbl}={score:.3e}{xi_s}')
             if score < bp_score:
                 bp_score = score
@@ -777,14 +1005,19 @@ class _PINNSolverBase:
         print(f'  -> continuing best probe (score={bp_score:.3e}) for {epochs} epochs')
 
         opt = self._make_optimizer(params)
-        sch = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs + 1, eta_min=self.scheduler_min_lr)
+        sch = self._make_scheduler(opt, epochs + 1)
         self._train_loop(epochs, strategy, use_lbfgs, opt, sch, epoch_offset=probe_epochs, global_best=global_best)
+
+        if self.inverse_enabled:
+            self.final_trained_estimates = self.get_estimated_parameters()
+            self.final_trained_l2 = self._eval_l2() if self.validation_func is not None else None
 
         if global_best['params'] is not None:
             for p, w in zip(params, global_best['params']):
                 p.data.copy_(w)
             self.lambda_bc = global_best['lam']
-            print(f"  -> global best L2 = {global_best['loss']:.3e}")
+            lbl = 'L2' if (self.validation_func is not None and not self.inverse_enabled) else 'selection score'
+            print(f"  -> global best {lbl} = {global_best['loss']:.3e}")
 
         return self
 
@@ -1003,7 +1236,7 @@ class _PINNSolverBase:
         net_params = []
         inv_params = []
         for p in params:
-            if getattr(self, 'use_singularity_capture', False) and p is self.xi_raw:
+            if getattr(self, 'use_singularity_capture', False) and (not self._xi_is_tied()) and p is self.xi_raw:
                 continue
             is_inv = False
             if getattr(self, 'inverse_enabled', False):
@@ -1018,12 +1251,26 @@ class _PINNSolverBase:
                 net_params.append(p)
         param_groups = [{'params': net_params, 'lr': self.lr}]
         if inv_params:
-            param_groups.append({'params': inv_params, 'lr': self.lr * 10.0})
-        if getattr(self, 'use_singularity_capture', False):
+            inv_lr_scale = float(getattr(self, 'inverse_lr_scale', 10.0))
+            param_groups.append({'params': inv_params, 'lr': self.lr * inv_lr_scale})
+        if getattr(self, 'use_singularity_capture', False) and not self._xi_is_tied():
             xi_lr = self.lr * getattr(self, 'xi_lr_scale', 0.1)
             self._xi_lr_base = xi_lr
             param_groups.append({'params': [self.xi_raw], 'lr': xi_lr})
         return optim.Adam(param_groups)
+
+    def _make_scheduler(self, opt, t_max):
+        if not getattr(self, 'inverse_enabled', False):
+            return optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(int(t_max), 1), eta_min=self.scheduler_min_lr)
+        floor_frac = float(self.scheduler_min_lr) / float(self.lr) if self.lr > 0 else 0.0
+        t_max = max(int(t_max), 1)
+
+        def lr_lambda(step, _floor=floor_frac, _tmax=t_max):
+            step = min(step, _tmax)
+            cos_factor = (1.0 + math.cos(math.pi * step / _tmax)) / 2.0
+            return _floor + (1.0 - _floor) * cos_factor
+
+        return optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
 
     def _predict_np(self, idx, x_t):
         raise NotImplementedError
@@ -1076,6 +1323,7 @@ class ParabolicPINNSolver(_PINNSolverBase):
         if scheme in ('L1_aux', 'L21_aux'):
             scheme = 'L21_aux'
         self.frac_scheme = scheme
+        self._l21_sigma_user = None if sigma is None else float(sigma)
         if scheme in ('L21sigma', 'L21_true'):
             alpha = getattr(self.physics, 'alpha', 0.5)
             self.l21_sigma = 1.0 - alpha / 2.0 if sigma is None else float(sigma)
@@ -1114,6 +1362,16 @@ class ParabolicPINNSolver(_PINNSolverBase):
                                         noise_std=float(noise_std))
         return self.inverse_data
 
+    def set_observations(self, observations):
+        self.inverse_data = {}
+        for i, obs in observations.items():
+            x, t, u = obs
+            self.inverse_data[i] = dict(
+                x=torch.as_tensor(np.asarray(x, dtype=float), dtype=NET_DTYPE, device=device).view(-1, 1),
+                t=torch.as_tensor(np.asarray(t, dtype=float), dtype=NET_DTYPE, device=device).view(-1, 1),
+                u_obs=torch.as_tensor(np.asarray(u, dtype=float), dtype=NET_DTYPE, device=device).view(-1, 1))
+        return self
+
     def _generate_mesh(self, max_val, n_pts, is_spatial=False):
         if is_spatial:
             return np.linspace(0, max_val, n_pts)
@@ -1127,6 +1385,9 @@ class ParabolicPINNSolver(_PINNSolverBase):
             self.xi_raw = nn.Parameter(self.xi_raw.data.to(device))
         else:
             self.xi_raw = nn.Parameter(self.xi_raw.data.to(device))
+        if self.inverse_enabled:
+            self.global_inv_params = None
+            self._inverse_initial_raw = {}
         if self.frac_scheme == 'L21_aux':
             if self.constraint_mode == 'hard':
                 raise NotImplementedError(
@@ -1136,10 +1397,12 @@ class ParabolicPINNSolver(_PINNSolverBase):
         t_np = self._generate_mesh(self.t_max, self.n_t)
         self.t_grid = torch.tensor(t_np, dtype=NET_DTYPE).view(-1, 1).to(device)
         alpha = getattr(self.physics, 'alpha', None)
+        if alpha is not None and self.inverse_enabled and self.inverse_include_alpha:
+            alpha = float(self.inverse_initial_guesses.get('alpha', alpha))
         if alpha is not None:
             if self.frac_scheme == 'L21sigma':
-                if not hasattr(self, 'l21_sigma') or self.l21_sigma is None:
-                    self.l21_sigma = 1.0 - alpha / 2.0
+                user_sigma = getattr(self, '_l21_sigma_user', None)
+                self.l21_sigma = (1.0 - alpha / 2.0) if user_sigma is None else user_sigma
                 self.Dt_alpha = _compute_l21sigma_matrix(alpha, t_np, self.l21_sigma).to(dtype=NET_DTYPE)
                 t_nsig_np = np.empty(self.n_t)
                 t_nsig_np[0] = t_np[0]
@@ -1188,33 +1451,38 @@ class ParabolicPINNSolver(_PINNSolverBase):
                                   X_mesh=x_grid.repeat(self.n_t, 1), T_mesh=T_mesh, T_mesh_nsig=T_mesh_nsig,
                                   f_target=f_target, physics=phys_i)
             if self.inverse_enabled:
-                if self.inverse_include_alpha and self.frac_scheme != 'L1':
-                    raise NotImplementedError("Inverse alpha estimation requires frac_scheme='L1'.")
-                inv_params = {}
-                for pname in self.inverse_parameter_names:
-                    if not hasattr(phys_i, pname):
-                        raise AttributeError(f"Physics on edge {i} has no attribute '{pname}'.")
-                    bnd = self.inverse_param_bounds.get(pname, None)
-                    inv_params[pname] = {
-                        'raw': nn.Parameter(self._raw_from_value(float(getattr(phys_i, pname)), bnd).to(device)),
-                        'bounds': bnd}
-                if self.inverse_include_alpha:
-                    ab = self.inverse_alpha_bounds
-                    inv_params['alpha'] = {
-                        'raw': nn.Parameter(self._raw_from_value(float(phys_i.alpha), ab).to(device)), 'bounds': ab}
+                if self.inverse_include_alpha and self.frac_scheme not in ('L1', 'L21sigma'):
+                    raise NotImplementedError(
+                        "Inverse alpha estimation requires frac_scheme='L1' or 'L21sigma' "
+                        "(the per-step differentiable Dt_alpha rebuild in compute_losses only "
+                        "has a torch/autograd implementation for those two schemes).")
+                if i == 0 or not getattr(self, 'inverse_shared', True):
+                    inv_params = self._build_inverse_params(i, phys_i)
+                    if i == 0:
+                        self.global_inv_params = inv_params
+                else:
+                    inv_params = self.global_inv_params or {}
                 if inv_params:
                     self.models[i]['inv_params'] = inv_params
         self.compiled = True
+        self._report_inverse_start()
         return self
 
     def predict(self, idx, x, t, return_components=False):
         m = self.models[idx]
         x_hat = (x / m['L']).to(NET_DTYPE)
         if self.use_singularity_capture:
-            xi = torch.exp(self.xi_raw)
+            if self._xi_is_tied() and 'inv_params' in m and 'alpha' in m['inv_params']:
+                xi = self._edge_param_value(idx, 'alpha')
+            else:
+                xi = torch.exp(self.xi_raw)
             Z = t.clamp(min=1e-30).pow(xi)
             x_smooth = torch.cat([x_hat, t], dim=-1)
-            u_raw = m['net'](x_smooth, Z)
+            v = m['net'](x_smooth, Z)
+            if self.singularity_mode == 'multiplicative':
+                u_raw = m['physics'].get_ic(x) + Z * v
+            else:
+                u_raw = v
         else:
             inp = torch.cat([x_hat, t], dim=-1)
             u_raw = m['net'](inp)
@@ -1281,7 +1549,11 @@ class ParabolicPINNSolver(_PINNSolverBase):
             u_matrix_reshaped = u_grid.view(self.n_t, n_x_m)
             if self.inverse_enabled and 'inv_params' in m and ('alpha' in m['inv_params']):
                 alpha_i = self._edge_param_value(i, 'alpha')
-                Dt_i = _compute_l1_matrix_torch(alpha_i, self.t_grid.view(-1)).to(dtype=NET_DTYPE)
+                if self.frac_scheme == 'L21sigma':
+                    Dt_i = _compute_l21sigma_matrix_torch(
+                        alpha_i, self.t_grid.view(-1), self.l21_sigma).to(dtype=NET_DTYPE)
+                else:
+                    Dt_i = _compute_l1_matrix_torch(alpha_i, self.t_grid.view(-1)).to(dtype=NET_DTYPE)
                 dt_alpha_u = torch.mm(Dt_i, u_matrix_reshaped).view(-1, 1)
             elif self.frac_scheme == 'L21_aux':
                 dt_alpha_u = self._compute_aux_caputo_derivative(i, m)
@@ -1402,8 +1674,8 @@ class ParabolicPINNSolver(_PINNSolverBase):
 
 
             with torch.no_grad():
-                x_tensor = torch.tensor(x_flat, dtype=torch.float32, device=device).unsqueeze(1)
-                t_tensor = torch.tensor(t_flat, dtype=torch.float32, device=device).unsqueeze(1)
+                x_tensor = torch.tensor(x_flat, dtype=NET_DTYPE, device=device).unsqueeze(1)
+                t_tensor = torch.tensor(t_flat, dtype=NET_DTYPE, device=device).unsqueeze(1)
 
                 up = self.predict(idx, x_tensor, t_tensor).detach().cpu().numpy().ravel()
 
@@ -1519,6 +1791,7 @@ class EllipticPINNSolver(_PINNSolverBase):
         if scheme in ('L1_aux', 'L21_aux'):
             scheme = 'L21_aux'
         self.frac_scheme = scheme
+        self._l21_sigma_user = None if sigma is None else float(sigma)
         if scheme == 'L21sigma':
             alpha = getattr(self.physics, 'alpha', 1.5)
             self.l21_sigma = 1.0 - (alpha - 1.0) / 2.0 if sigma is None else float(sigma)
@@ -1574,6 +1847,15 @@ class EllipticPINNSolver(_PINNSolverBase):
                                         u_obs=torch.tensor(noisy, dtype=NET_DTYPE, device=device).view(-1, 1),
                                         noise_std=float(noise_std))
         return self.inverse_data
+
+    def set_observations(self, observations):
+        self.inverse_data = {}
+        for i, obs in observations.items():
+            x, u = obs
+            self.inverse_data[i] = dict(
+                x=torch.as_tensor(np.asarray(x, dtype=float), dtype=NET_DTYPE, device=device).view(-1, 1),
+                u_obs=torch.as_tensor(np.asarray(u, dtype=float), dtype=NET_DTYPE, device=device).view(-1, 1))
+        return self
 
     @staticmethod
     def _l1(alpha, grid_np):
@@ -1637,9 +1919,14 @@ class EllipticPINNSolver(_PINNSolverBase):
                 x_np = self._generate_mesh(L, n_pts)
                 x_grid = torch.tensor(x_np, dtype=NET_DTYPE).view(-1, 1).to(device)
                 if self.frac_scheme == 'L21sigma':
-                    Da64 = _compute_l21sigma_matrix(a - 1.0, x_np)
-                    Db64 = _compute_l21sigma_matrix((phys_i.beta), x_np)
-                    sig_a = 1.0 - (a - 1.0) / 2.0
+                    a_sig = a
+                    if self.inverse_enabled and self.inverse_include_alpha:
+                        a_sig = float(self.inverse_initial_guesses.get('alpha', a))
+                    user_sigma = getattr(self, '_l21_sigma_user', None)
+                    sig_a = (1.0 - (a_sig - 1.0) / 2.0) if user_sigma is None else user_sigma
+                    self.l21_sigma = sig_a
+                    Da64 = _compute_l21sigma_matrix(a - 1.0, x_np, sig_a)
+                    Db64 = _compute_l21sigma_matrix(float(phys_i.beta), x_np, sig_a)
                     x_nsig_np = np.empty(n_pts)
                     x_nsig_np[0] = x_np[0]
                     x_nsig_np[1:] = (1.0 - sig_a) * x_np[:-1] + sig_a * x_np[1:]
@@ -1650,8 +1937,6 @@ class EllipticPINNSolver(_PINNSolverBase):
                     x_nsig_np = x_np
                     x_nsig_grid = x_grid
             if self.use_singularity_capture:
-
-
                 net = SDCNet(smooth_dim=1, raw_dim=1, hidden_dim=self.hidden_dim, hidden_layers=self.hidden_layers,
                              use_fourier=self.use_fourier, fourier_dim=self.fourier_dim,
                              fourier_sigma=self.fourier_sigma,
@@ -1672,25 +1957,21 @@ class EllipticPINNSolver(_PINNSolverBase):
                               'aux_x_grid_b': aux_x_grid_b, 'aux_weights_b': aux_weights_b,
                               'f_target': torch.tensor(f_target, dtype=NET_DTYPE).view(-1, 1).to(device),
                               'physics': phys_i}
+            self.models[i]['l21_sigma'] = sig_a if self.frac_scheme == 'L21sigma' else None
             if self.inverse_enabled:
-                if self.inverse_include_alpha and self.frac_scheme != 'L1':
-                    raise NotImplementedError("Inverse alpha estimation requires frac_scheme='L1'.")
-                if self.global_inv_params is None:
-                    inv_params = {}
-                    for pname in self.inverse_parameter_names:
-                        bnd = self.inverse_param_bounds.get(pname, None)
-                        init_val = self.inverse_initial_guesses.get(pname, float(getattr(phys_i, pname)))
-                        inv_params[pname] = {
-                            'raw': nn.Parameter(self._raw_from_value(init_val, bnd).to(device)),
-                            'bounds': bnd}
-                    if self.inverse_include_alpha:
-                        ab = self.inverse_alpha_bounds
-                        init_alpha = self.inverse_initial_guesses.get('alpha', float(phys_i.alpha))
-                        inv_params['alpha'] = {
-                            'raw': nn.Parameter(self._raw_from_value(init_alpha, ab).to(device)), 'bounds': ab}
-                    self.global_inv_params = inv_params
-                if self.global_inv_params:
-                    self.models[i]['inv_params'] = self.global_inv_params
+                learns_order = self.inverse_include_alpha or ('alpha' in self.inverse_parameter_names) or (
+                        'beta' in self.inverse_parameter_names)
+                if learns_order and self.frac_scheme not in ('L1', 'L21sigma'):
+                    raise NotImplementedError(
+                        "Inverse estimation of alpha/beta requires frac_scheme='L1' or 'L21sigma'.")
+                if self.global_inv_params is None or not getattr(self, 'inverse_shared', True):
+                    inv_params = self._build_inverse_params(i, phys_i)
+                    if self.global_inv_params is None:
+                        self.global_inv_params = inv_params
+                else:
+                    inv_params = self.global_inv_params
+                if inv_params:
+                    self.models[i]['inv_params'] = inv_params
         if self.anchor_pts > 0:
             self._run_fd_inverse_solver()
             if self.lambda_data_schedule is None:
@@ -1701,12 +1982,16 @@ class EllipticPINNSolver(_PINNSolverBase):
         print(
             f'  [elliptic mesh] scheme={self.frac_scheme}  n_pts/unit={self.pts_per_unit}  grading={self.grading_factor:.2f}  Z(x)={self.use_singularity_capture}')
         self.compiled = True
+        self._report_inverse_start()
         return self
 
     def predict(self, idx, x):
         m = self.models[idx]
         if self.use_singularity_capture:
-            xi = torch.exp(self.xi_raw)
+            if self._xi_is_tied() and 'inv_params' in m and 'alpha' in m['inv_params']:
+                xi = self._edge_param_value(idx, 'alpha')
+            else:
+                xi = torch.exp(self.xi_raw)
             z = x.clamp(min=1e-30).pow(xi)
             u_raw = m['net'](x, z)
         else:
@@ -1753,8 +2038,14 @@ class EllipticPINNSolver(_PINNSolverBase):
                     float(phys.alpha), dtype=NET_DTYPE, device=device)
                 b_ord = self._edge_param_value(i, 'beta') if 'beta' in m['inv_params'] else torch.tensor(
                     float(phys.beta), dtype=NET_DTYPE, device=device)
-                Da_t = self._l1_torch(a_ord - 1.0, m['x_grid'].view(-1)).to(dtype=NET_DTYPE)
-                Db_t = self._l1_torch(b_ord, m['x_grid'].view(-1)).to(dtype=NET_DTYPE)
+                if self.frac_scheme == 'L21sigma':
+                    Da_t = _compute_l21sigma_matrix_torch(a_ord - 1.0, m['x_grid'].view(-1), m['l21_sigma']).to(
+                        dtype=NET_DTYPE)
+                    Db_t = _compute_l21sigma_matrix_torch(b_ord, m['x_grid'].view(-1), m['l21_sigma']).to(
+                        dtype=NET_DTYPE)
+                else:
+                    Da_t = self._l1_torch(a_ord - 1.0, m['x_grid'].view(-1)).to(dtype=NET_DTYPE)
+                    Db_t = self._l1_torch(b_ord, m['x_grid'].view(-1)).to(dtype=NET_DTYPE)
                 d_beta_u = torch.mm(Db_t, u_reg)
                 d_alpha_u = torch.mm(Da_t, du_reg)
             elif self.frac_scheme == 'L21_aux':
@@ -1972,7 +2263,8 @@ def run_elliptic_inverse(graph, physics_list, exact_funcs_per_edge, *, parameter
                          n_points_per_edge=80, noise_std=0.01, seed=123, epochs=6000, pts_per_unit=220,
                          grading_factor=1.5, arch=None, frac_scheme='L1', l21_sigma=None,
                          use_singularity_capture=False, xi_init=None, lr=0.0005,
-                         min_lr=1e-06):
+                         min_lr=1e-06, initial_guesses=None, shared=True, tie_xi_to_alpha=False,
+                         dynamic_data_weight=False):
     arch = arch or DEFAULT_ELLIPTIC_ARCH
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -1986,7 +2278,9 @@ def run_elliptic_inverse(graph, physics_list, exact_funcs_per_edge, *, parameter
     solver.set_lr(lr=lr, min_lr=min_lr)
     solver.set_inverse_problem(parameter_names=list(parameter_names), include_alpha=include_alpha,
                                param_bounds=dict(param_bounds) if param_bounds else {}, alpha_bounds=alpha_bounds,
-                               data_weight=data_weight)
+                               data_weight=data_weight, initial_guesses=initial_guesses, shared=shared)
+    solver.set_xi_tied_to_alpha(tie_xi_to_alpha)
+    solver.set_data_dynamic_weighting(dynamic_data_weight)
     val_list = [lambda x, L, i=i: exact_funcs_per_edge[i](x) for i in range(len(physics_list))]
     solver.set_validation(val_list)
     solver.compile()
@@ -2054,7 +2348,8 @@ def parabolic_sweep_error_plot(results, r_values, alpha, scheme, n_edges, save_p
 def run_parabolic_inverse(graph, physics_list, exact_u_per_edge, *, scheme='L1', r_grading=2.0, epochs=12000,
                           n_points_per_edge=60, noise_std=0.01, data_weight=20.0, seed=123, parameter_names=('nu',),
                           include_alpha=True, param_bounds=None, alpha_bounds=(0.2, 0.95), pinn_pts=100, n_t=100,
-                          t_max=1.0, arch=None):
+                          t_max=1.0, arch=None, initial_guesses=None, shared=True, tie_xi_to_alpha=True,
+                          dynamic_data_weight=False, singularity_mode='multiplicative'):
     arch = arch or DEFAULT_PARABOLIC_ARCH
     n_edges = len(physics_list)
     torch.manual_seed(seed)
@@ -2064,14 +2359,17 @@ def run_parabolic_inverse(graph, physics_list, exact_u_per_edge, *, scheme='L1',
     solver.set_architecture(**arch)
     solver.set_mesh(mesh_type='power_law', pinn_pts=pinn_pts, n_t=n_t, grading_factor=r_grading, t_max=t_max)
     solver.set_constraints('soft')
-    alpha0 = float(getattr(physics_list[0], 'alpha', 0.5))
-    solver.set_singularity_capture(enabled=True, xi_init=alpha0, xi_loss_adaptive=True)
+    alpha0 = float((initial_guesses or {}).get('alpha', getattr(physics_list[0], 'alpha', 0.5)))
+    solver.set_singularity_capture(enabled=True, xi_init=alpha0, xi_loss_adaptive=True, mode=singularity_mode)
     solver.set_lr(lr=0.0005, min_lr=1e-05, xi_lr_scale=0.1, xi_lr_scale_phase2=0.01)
     pb = dict(param_bounds) if param_bounds else {}
     if 'nu' in parameter_names and 'nu' not in pb:
         pb['nu'] = (0.1, 2.0)
     solver.set_inverse_problem(parameter_names=list(parameter_names), include_alpha=include_alpha, param_bounds=pb,
-                               alpha_bounds=alpha_bounds, data_weight=data_weight)
+                               alpha_bounds=alpha_bounds, data_weight=data_weight, initial_guesses=initial_guesses,
+                               shared=shared)
+    solver.set_xi_tied_to_alpha(tie_xi_to_alpha)
+    solver.set_data_dynamic_weighting(dynamic_data_weight)
     exact_fns = [lambda x, t, i=i: exact_u_per_edge(i, x, t) for i in range(n_edges)]
     solver.compile()
     solver.generate_noisy_edge_data(exact_func=exact_fns, n_points_per_edge=n_points_per_edge, noise_std=noise_std,
